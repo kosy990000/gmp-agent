@@ -17,6 +17,9 @@ EMBED_MODEL = "text-embedding-3-small"  # 저렴한 임베딩. 바꾸면 ingest.
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 150
 TOP_K = 5  # 검색 시 가져올 청크 수
+HISTORY_WINDOW = 3  # 전문 그대로 유지할 최근 대화 턴 수 (초과분은 요약)
+MAX_QUERY_REWRITES = 2  # Agentic RAG: 검색 결과가 부실할 때 질문 재작성 최대 횟수
+WEB_SEARCH_FALLBACK = True  # 내부 문서 검색이 끝내 실패하면 웹 검색으로 폴백 (OpenAI web_search 툴, 호출당 추가 과금)
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 CHROMA_DIR.mkdir(parents=True, exist_ok=True)

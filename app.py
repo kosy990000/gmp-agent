@@ -13,6 +13,8 @@ from langchain_openai import OpenAIEmbeddings
 from langchain_chroma import Chroma
 
 import config
+import db
+import graph
 import rag
 import vision
 
@@ -55,6 +57,13 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 if "session_store" not in st.session_state:
     st.session_state.session_store = None
+if "history_summary" not in st.session_state:
+    st.session_state.history_summary = ""
+if "summarized_count" not in st.session_state:
+    st.session_state.summarized_count = 0
+if "session_id" not in st.session_state:
+    import uuid
+    st.session_state.session_id = str(uuid.uuid4())
 
 # ── 사이드바: 파일 업로드 ─────────────────────────────────────────
 with st.sidebar:
@@ -95,7 +104,32 @@ if prompt := st.chat_input("GMP 문서에 대해 질문하세요"):
     with st.chat_message("assistant"):
         with st.spinner("문서 검색 + 답변 생성 중..."):
             try:
-                content, docs = rag.answer(prompt, extra_store=st.session_state.session_store)
+                all_prev = st.session_state.messages[:-1]  # 현재 질문 제외
+                window = config.HISTORY_WINDOW * 2          # 턴 → 메시지 수
+
+                # 창 밖으로 밀려난 오래된 메시지가 있으면 요약 + 패턴 추출 후 DB 저장
+                old_messages = all_prev[:-window] if len(all_prev) > window else []
+                if len(old_messages) > st.session_state.summarized_count:
+                    # 이미 요약에 반영된 앞부분은 제외 — 새로 밀려난 메시지만 기존 요약에 증분 병합
+                    unsummarized = old_messages[st.session_state.summarized_count:]
+                    with st.spinner("이전 대화 요약 중..."):
+                        result = rag.summarize_history(unsummarized, st.session_state.history_summary)
+                    st.session_state.history_summary = result["summary"]
+                    st.session_state.summarized_count = len(old_messages)
+                    db.save_log(
+                        session_id=st.session_state.session_id,
+                        summary=result["summary"],
+                        topics=result["topics"],
+                        question_pattern=result["question_pattern"],
+                    )
+
+                recent = all_prev[-window:] if len(all_prev) > window else all_prev
+                # Agentic RAG (LangGraph) — 검색 필요 판단·관련성 평가·질문 재작성 반복
+                content, docs = graph.answer_agentic(
+                    prompt, recent,
+                    history_summary=st.session_state.history_summary,
+                    extra_store=st.session_state.session_store,
+                )
             except Exception as e:
                 content, docs = f"⚠️ 오류: {e}", []
         st.markdown(content)

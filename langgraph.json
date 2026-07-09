@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "gmp-agent": "./graph.py:studio_graph"
+  },
+  "env": ".env"
+}
