@@ -1,7 +1,8 @@
-"""data/gmp 안의 GMP 규정집(PDF/DOCX/HWP)을 청크로 쪼개 Chroma 벡터DB에 색인.
+"""data/ 안의 규정 문서(PDF/DOCX/HWP — gmp/, ICH-guideline/ 등 하위 폴더 포함)를
+청크로 쪼개 Chroma 벡터DB에 색인.
 
 사용법:
-    .venv/bin/python ingest.py            # data/gmp 전체 색인
+    .venv/bin/python ingest.py            # data/ 전체 색인
     .venv/bin/python ingest.py --reset    # 기존 색인 지우고 새로
     .venv/bin/python ingest.py --no-vision  # 이미지 설명 생성 건너뜀 (비용 절약)
 """
@@ -77,8 +78,15 @@ def _load_hwp(path) -> list[Document]:
     return [Document(page_content="\n".join(texts), metadata={"source": path.name, "page": 0})]
 
 
+# data/ 바로 아래 폴더명을 문서 종류 태그로 사용 (예: gmp, ich-guideline)
+# 나중에 "ICH 질문이면 ICH 문서만 필터 검색" 같은 라우팅에 쓰기 위한 메타데이터
+def _doc_type(path, folder) -> str:
+    rel = path.relative_to(folder)
+    return rel.parts[0].lower() if len(rel.parts) > 1 else "root"
+
+
 def load_documents(folder) -> list[Document]:
-    """PDF / DOCX / HWP 파일을 모두 로드. 메타데이터에 출처 파일명 기록."""
+    """PDF / DOCX / HWP 파일을 모두 로드. 메타데이터에 출처 파일명·문서 종류 기록."""
     docs = []
     exts = {".pdf", ".docx", ".hwp"}
     files = [p for p in folder.rglob("*") if p.suffix.lower() in exts]
@@ -96,6 +104,7 @@ def load_documents(folder) -> list[Document]:
             loaded = _load_hwp(path)
         for d in loaded:
             d.metadata["source"] = path.name
+            d.metadata["doc_type"] = _doc_type(path, folder)
         docs.extend(loaded)
     return docs
 
@@ -157,6 +166,7 @@ def extract_image_descriptions(folder, vision_model: str) -> list[Document]:
                         "source": path.name,
                         "page": page_num,
                         "type": "image_description",
+                        "doc_type": _doc_type(path, folder),
                     },
                 ))
                 print(f"    + 이미지 설명 추가 (p.{page_num+1}): {description[:50]}...")

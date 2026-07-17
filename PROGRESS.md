@@ -25,8 +25,9 @@
 
 ```
 gmp-agent/
-├── data/gmp/                 ← GMP 규정집 PDF/Word 원본 (색인 대상)
-│   └── 우수화장품 제조 및 품질관리기준(CGMP) 해설서.pdf
+├── data/                     ← 규정 문서 원본 (색인 대상, 하위 폴더명이 doc_type 태그가 됨)
+│   ├── gmp/                  ← 우수화장품 제조 및 품질관리기준(CGMP) 해설서.pdf
+│   └── ICH-guideline/        ← ICH Q 시리즈 가이드라인 (영어, Q1/Q3/Q4 등 폴더별)
 ├── storage/chroma/           ← 벡터DB (색인 결과 영구 저장)
 ├── .venv/                    ← Python 3.12 가상환경
 ├── .env                      ← OPENAI_API_KEY
@@ -241,9 +242,33 @@ Codex 코드 리뷰(`/codex:review`)가 지적한 기존 코드 버그 3건 수�
 
 ---
 
+### ✅ 7단계 — ICH 영어 문서 지원: 한·영 이중 검색 (완료, 2026-07-17)
+
+**목적**: `data/ICH-guideline/`에 추가된 영어 ICH 가이드라인을 한국어 질문으로도 검색 가능하게.
+한국어 질문 ↔ 영어 문서는 BM25 키워드가 아예 안 겹치고 dense 교차 언어 매칭도 약한 문제 해결.
+
+**변경 파일**: `config.py`(DATA_DIR), `graph.py`(한·영 검색어), `rag.py`(프롬프트), `ingest.py`(doc_type 태깅)
+
+**구현 내용**
+- `config.py` — `DATA_DIR`을 `data/gmp` → `data/`로 확장 (ICH-guideline 하위 폴더 색인 대상 포함)
+- `graph.py` — `route`가 structured output 으로 **영어 검색어(`search_query_en`)를 추가 생성** (LLM 호출 횟수 불변).
+  `retrieve`는 한·영 검색어로 각각 하이브리드 검색 후 (source, page, 본문 앞 80자) 기준 중복 제거.
+  `rewrite`도 한·영 두 벌을 동시 재작성 (structured output 으로 전환)
+- `ingest.py` — `data/` 바로 아래 폴더명을 `doc_type` 메타데이터로 태깅 (`gmp` / `ich-guideline`).
+  향후 "ICH 질문이면 ICH 문서만 필터 검색" 라우팅용. 이미지 설명 청크에도 동일 적용
+- `rag.py` — SYSTEM_PROMPT에 "영어 문맥이어도 한국어로 답하되 전문 용어는 영어 병기" 규칙 추가
+
+**재색인 필요**: ICH 문서가 색인에 없으므로 `--reset` 재색인 필수. ICH PDF 수백 개라 비전 비용 주의
+```
+.venv/bin/python ingest.py --reset --no-vision   # ICH 추가분 텍스트만 색인 (권장)
+```
+
+---
+
 ## 다음 단계 (예정)
 
-- **이미지 재색인** `.venv/bin/python ingest.py --reset` — MIME 버그 수정 후 미실행 상태. 비전 호출 ~319회 비용 발생하므로 실행 판단 필요
+- **전체 재색인** `.venv/bin/python ingest.py --reset` — ICH 문서 추가 + MIME 버그 수정 후 미실행 상태. ICH 추가 완료 후 실행 (비전 비용 크면 `--no-vision`)
+- **(optional) 임베딩 업그레이드** `text-embedding-3-small` → `text-embedding-3-large` — 한↔영 교차 언어 dense 검색 정렬이 더 좋음. 비용 ~6.5배 + 전체 재색인 필요. 한·영 이중 검색어(7단계)만으로 ICH 검색 품질이 부족할 때 도입 판단. 변경 시 `config.py` `EMBED_MODEL` 수정 후 `--reset` 재색인
 - 평가 데이터셋 확장 (후속 질문 시나리오, 이미지 설명 청크 검증 문항, **웹 폴백 시나리오**)
 - README.md 보완 예정 항목: MultiVectorRetriever, HWP 표 추출, 이미지 설명 캐싱, DB 통계 사이드바
 - 프롬프트·검색 파라미터 변경 시 eval_rag.py 로 회귀 테스트

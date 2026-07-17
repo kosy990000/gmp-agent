@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 load_dotenv()  # .env 의 OPENAI_API_KEY 등 로드
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data" / "gmp"          # 미리 색인할 GMP 규정집 원본
+DATA_DIR = BASE_DIR / "data"                   # 미리 색인할 문서 원본 (gmp/, ICH-guideline/ 하위 폴더 포함)
 CHROMA_DIR = BASE_DIR / "storage" / "chroma"   # 벡터DB 영구 저장 위치
 COLLECTION = "gmp_docs"                          # 미리 색인된 기본 컬렉션
 

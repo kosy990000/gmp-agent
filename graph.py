@@ -7,8 +7,9 @@
                    │      │             └→ web_search → generate
                    └→ direct → END
 
-- route:      검색 필요 여부 판단 + 후속 질문을 독립 검색어로 재작성 (LLM 1회로 동시 처리)
-- retrieve:   rag.retrieve() 하이브리드 검색 그대로 재사용
+- route:      검색 필요 여부 판단 + 후속 질문을 한국어·영어 검색어로 재작성 (LLM 1회로 동시 처리)
+- retrieve:   rag.retrieve() 하이브리드 검색을 한·영 검색어로 각각 실행 후 중복 제거
+              (ICH 등 영어 문서는 영어 검색어라야 BM25 키워드 매칭이 됨)
 - grade:      검색 결과가 질문과 관련 있는지 LLM 평가
 - rewrite:    관련성 낮으면 검색 질문을 개선해 재검색 (최대 MAX_QUERY_REWRITES회)
 - web_search: 재검색까지 실패하면 웹 검색(OpenAI web_search 툴)으로 폴백 — 찾은 내용을
@@ -40,6 +41,7 @@ class GraphState(TypedDict):
     chat_history: list[BaseMessage]  # 요약 + 최근 대화 (rag.build_chat_history 결과)
     needs_search: bool               # route 노드의 검색 필요 판단
     search_query: str                # 검색에 실제 사용할 질문 (재작성될 수 있음)
+    search_query_en: str             # 영어 문서(ICH 등) 검색용 영어 검색 질문
     docs: list[Document]             # 검색된 청크
     rewrite_count: int               # 질문 개선 횟수 (무한 루프 방지)
     web_searched: bool               # 웹 검색 폴백 사용 여부 — generate 가 웹 출처 표시에 사용
@@ -64,6 +66,10 @@ class _RouteDecision(BaseModel):
     search_query: str = Field(
         description="대화 맥락을 반영해 단독으로 이해 가능하게 재작성한 한국어 검색 질문. 이미 독립적이면 원래 질문 그대로."
     )
+    search_query_en: str = Field(
+        description="같은 질문을 ICH 가이드라인 등 영어 규제 문서 검색용으로 번역한 영어 검색 질문. "
+                    "stability testing, impurities, validation 같은 GMP/ICH 공식 용어를 사용."
+    )
 
 
 def route(state: GraphState) -> dict:
@@ -72,7 +78,8 @@ def route(state: GraphState) -> dict:
                    "사용자는 GMP 규정에 대해 묻는 실무자이므로, 업무와 조금이라도 관련된 질문은 "
                    "모두 문서 검색이 필요합니다(needs_search=true). "
                    "명백한 인사말·잡담·감사 표현일 때만 needs_search=false 로 판단하세요. "
-                   "그리고 대화 기록을 참고해 후속 질문을 단독으로 이해 가능한 검색 질문으로 재작성하세요."),
+                   "그리고 대화 기록을 참고해 후속 질문을 단독으로 이해 가능한 검색 질문으로 재작성하고, "
+                   "영어 규제 문서(ICH 가이드라인 등) 검색을 위해 같은 질문을 영어로도 작성하세요."),
         MessagesPlaceholder(variable_name="chat_history"),
         ("human", "질문: {question}"),
     ])
@@ -84,6 +91,7 @@ def route(state: GraphState) -> dict:
     return {
         "needs_search": decision.needs_search,
         "search_query": decision.search_query.strip() or state["question"],
+        "search_query_en": decision.search_query_en.strip(),
     }
 
 
@@ -95,8 +103,20 @@ def route_decision(state: GraphState) -> Literal["retrieve", "direct"]:
 
 
 def retrieve(state: GraphState) -> dict:
+    # 한국어 검색어(국내 문서) + 영어 검색어(ICH 등 영어 문서)로 각각 하이브리드 검색.
+    # 영어 문서는 한국어 질문으로 BM25 키워드 매칭이 안 되므로 영어 검색어가 필수
     docs = rag.retrieve(state["search_query"], state.get("extra_store"))
-    return {"docs": docs}
+    if state.get("search_query_en"):
+        docs += rag.retrieve(state["search_query_en"], state.get("extra_store"))
+
+    # 두 검색 결과에서 같은 청크 중복 제거 (출처+페이지+본문 앞부분 기준)
+    seen, unique = set(), []
+    for d in docs:
+        key = (d.metadata.get("source"), d.metadata.get("page"), d.page_content[:80])
+        if key not in seen:
+            seen.add(key)
+            unique.append(d)
+    return {"docs": unique}
 
 
 # ── grade: 검색 결과 관련성 평가 (조건부 엣지) ──────────────────────
@@ -129,19 +149,32 @@ def grade_documents(state: GraphState) -> Literal["generate", "rewrite", "web_se
 # ── rewrite: 검색 질문 개선 후 재검색 ───────────────────────────────
 
 
+class _RewrittenQueries(BaseModel):
+    """실패한 검색 질문을 한국어·영어 두 벌로 개선"""
+
+    search_query: str = Field(
+        description="GMP 규정 용어를 사용해 검색이 잘 되도록 재작성한 한국어 검색 질문"
+    )
+    search_query_en: str = Field(
+        description="ICH 가이드라인 등 영어 규제 문서 검색용으로 공식 용어를 써서 재작성한 영어 검색 질문"
+    )
+
+
 def rewrite(state: GraphState) -> dict:
     prompt = ChatPromptTemplate.from_messages([
-        ("system", "검색 질문이 GMP 문서에서 관련 내용을 찾지 못했습니다. "
-                   "질문의 의도를 유지하면서 GMP 규정 용어를 사용해 검색이 잘 되도록 한국어로 재작성하세요. "
-                   "재작성된 질문만 출력하세요."),
-        ("human", "원래 질문: {question}\n실패한 검색 질문: {search_query}"),
+        ("system", "검색 질문이 GMP/ICH 문서에서 관련 내용을 찾지 못했습니다. "
+                   "질문의 의도를 유지하면서 검색이 잘 되도록 한국어 검색 질문과 "
+                   "영어 검색 질문(ICH 등 영어 문서용)을 각각 재작성하세요."),
+        ("human", "원래 질문: {question}\n실패한 한국어 검색 질문: {search_query}\n실패한 영어 검색 질문: {search_query_en}"),
     ])
-    resp = (prompt | _llm()).invoke({
+    resp = (prompt | _llm().with_structured_output(_RewrittenQueries)).invoke({
         "question": state["question"],
         "search_query": state["search_query"],
+        "search_query_en": state.get("search_query_en", ""),
     })
     return {
-        "search_query": resp.content.strip(),
+        "search_query": resp.search_query.strip(),
+        "search_query_en": resp.search_query_en.strip(),
         "rewrite_count": state.get("rewrite_count", 0) + 1,
     }
 
@@ -279,6 +312,7 @@ def answer_agentic(
         "chat_history": rag.build_chat_history(recent_messages, history_summary),
         "needs_search": True,
         "search_query": question,
+        "search_query_en": "",
         "docs": [],
         "rewrite_count": 0,
         "web_searched": False,
