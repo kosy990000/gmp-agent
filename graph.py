@@ -21,6 +21,7 @@ app.py 는 answer_agentic() 만 호출 — answer_with_history() 와 동일하�
 (답변 텍스트, 근거 문서 리스트)를 돌려받음.
 """
 from functools import lru_cache
+from itertools import zip_longest
 from typing import Literal, TypedDict
 
 from langchain_chroma import Chroma
@@ -105,18 +106,27 @@ def route_decision(state: GraphState) -> Literal["retrieve", "direct"]:
 def retrieve(state: GraphState) -> dict:
     # 한국어 검색어(국내 문서) + 영어 검색어(ICH 등 영어 문서)로 각각 하이브리드 검색.
     # 영어 문서는 한국어 질문으로 BM25 키워드 매칭이 안 되므로 영어 검색어가 필수
-    docs = rag.retrieve(state["search_query"], state.get("extra_store"))
-    if state.get("search_query_en"):
-        docs += rag.retrieve(state["search_query_en"], state.get("extra_store"))
+    ko_docs = rag.retrieve(state["search_query"], state.get("extra_store"))
+    en_docs = rag.retrieve(state["search_query_en"], state.get("extra_store")) \
+        if state.get("search_query_en") else []
 
-    # 두 검색 결과에서 같은 청크 중복 제거 (출처+페이지+본문 앞부분 기준)
+    # 한·영 결과를 상위부터 번갈아(interleave) 섞음 — 단순 append 하면 영어 결과가
+    # 항상 뒤로 밀려 상위 컷오프에서 통째로 잘리므로, 양쪽 상위 청크를 고르게 보존
+    merged = []
+    for ko, en in zip_longest(ko_docs, en_docs):
+        if ko is not None:
+            merged.append(ko)
+        if en is not None:
+            merged.append(en)
+
+    # 같은 청크 중복 제거 (출처+페이지+본문 앞부분 기준) 후 상위 N개로 제한
     seen, unique = set(), []
-    for d in docs:
+    for d in merged:
         key = (d.metadata.get("source"), d.metadata.get("page"), d.page_content[:80])
         if key not in seen:
             seen.add(key)
             unique.append(d)
-    return {"docs": unique}
+    return {"docs": unique[:config.RETRIEVE_MERGE_LIMIT]}
 
 
 # ── grade: 검색 결과 관련성 평가 (조건부 엣지) ──────────────────────
@@ -172,9 +182,12 @@ def rewrite(state: GraphState) -> dict:
         "search_query": state["search_query"],
         "search_query_en": state.get("search_query_en", ""),
     })
+    # LLM이 빈 문자열을 반환하면 이전 검색어(없으면 원 질문)로 보정 — 빈 쿼리로 재검색 방지
+    new_ko = resp.search_query.strip() or state["search_query"] or state["question"]
+    new_en = resp.search_query_en.strip() or state.get("search_query_en", "")
     return {
-        "search_query": resp.search_query.strip(),
-        "search_query_en": resp.search_query_en.strip(),
+        "search_query": new_ko,
+        "search_query_en": new_en,
         "rewrite_count": state.get("rewrite_count", 0) + 1,
     }
 

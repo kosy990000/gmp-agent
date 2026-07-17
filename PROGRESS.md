@@ -249,26 +249,43 @@ Codex 코드 리뷰(`/codex:review`)가 지적한 기존 코드 버그 3건 수�
 
 **변경 파일**: `config.py`(DATA_DIR), `graph.py`(한·영 검색어), `rag.py`(프롬프트), `ingest.py`(doc_type 태깅)
 
+**변경 파일 (추가)**: `config.py`(`RETRIEVE_MERGE_LIMIT`), `graph.py`(`retrieve` 병합·제한, `rewrite` 빈쿼리 보정)
+
 **구현 내용**
-- `config.py` — `DATA_DIR`을 `data/gmp` → `data/`로 확장 (ICH-guideline 하위 폴더 색인 대상 포함)
+- `config.py` — `DATA_DIR`을 `data/gmp` → `data/`로 확장 (ICH-guideline 하위 폴더 색인 대상 포함).
+  `RETRIEVE_MERGE_LIMIT=10` 추가 — 한·영 병합 결과를 generate 문맥에 넣을 최대 청크 수
 - `graph.py` — `route`가 structured output 으로 **영어 검색어(`search_query_en`)를 추가 생성** (LLM 호출 횟수 불변).
-  `retrieve`는 한·영 검색어로 각각 하이브리드 검색 후 (source, page, 본문 앞 80자) 기준 중복 제거.
-  `rewrite`도 한·영 두 벌을 동시 재작성 (structured output 으로 전환)
+  `retrieve`는 한·영 검색어로 각각 하이브리드 검색 → **상위부터 번갈아 섞고(interleave)** (source, page, 본문 앞 80자) 기준 중복 제거 → 상위 `RETRIEVE_MERGE_LIMIT`개로 제한.
+  (단순 append 하면 영어 결과가 뒤로 밀려 컷오프에서 통째로 잘리므로 interleave 로 양쪽 상위 청크 보존)
+  `rewrite`도 한·영 두 벌을 동시 재작성 (structured output 으로 전환). LLM이 빈 문자열 반환 시 이전 검색어→원 질문 순으로 보정
 - `ingest.py` — `data/` 바로 아래 폴더명을 `doc_type` 메타데이터로 태깅 (`gmp` / `ich-guideline`).
   향후 "ICH 질문이면 ICH 문서만 필터 검색" 라우팅용. 이미지 설명 청크에도 동일 적용
-- `rag.py` — SYSTEM_PROMPT에 "영어 문맥이어도 한국어로 답하되 전문 용어는 영어 병기" 규칙 추가
+- `rag.py` — SYSTEM_PROMPT 보강: (규칙4) 영어 문맥이어도 한국어로 답하되 전문 용어 영어 병기,
+  **(규칙5) 영어 문맥의 표·수치·조건을 적극 해석해 답하고 영어라는 이유로 거절 금지**
 
-**재색인 필요**: ICH 문서가 색인에 없으므로 `--reset` 재색인 필수. ICH PDF 수백 개라 비전 비용 주의
-```
-.venv/bin/python ingest.py --reset --no-vision   # ICH 추가분 텍스트만 색인 (권장)
-```
+**핵심 발견 — generate 거절 버그**: 검색·문맥 조립은 정상인데, 원래 SYSTEM_PROMPT의 "문맥에 없으면 거절" 규칙(규칙1)이 너무 강해 gpt-4o-mini 가 영어 문맥(장기보존 조건이 명확히 있음)을 통째로 거절 → "찾을 수 없습니다" 오답. 규칙5 추가로 해결
+
+**재색인 완료** (2026-07-17): `.venv/bin/python ingest.py --reset --no-vision`
+- 결과: **2017 페이지 → 4114 청크** (`ich-guideline` 3764 + `gmp` 350), 로드 오류 0건, `doc_type` 태깅 정상
+
+**동작 확인 (전체 그래프)**
+- ICH 영어 질문("신약 원료의약품 장기보존 시험 조건") → 25°C±2°C/60%RH·12개월 등 정확히 답변, 근거 10청크
+- 국내 GMP 질문("교육훈련 기록 관리") → 회귀 없음
+- 인사말 → direct 경로, 근거 0청크
+- `retrieve` 병합 결과가 `RETRIEVE_MERGE_LIMIT=10` 이하로 제한됨 확인
+
+**Codex 코드 리뷰** (`/codex:rescue`) — 이번 변경 검증
+- 조치 완료: `rewrite` 빈쿼리 보정, 병합 후 TOP_K 제한(interleave)
+- 미조치(현재 실제 발생 0건, 우선순위 낮음): `route`/`rewrite` structured output 실패 fallback,
+  중복제거 키 안정화(동명 파일·Chroma id), 세션 업로드 PDF `doc_type` 태깅
 
 ---
 
 ## 다음 단계 (예정)
 
-- **전체 재색인** `.venv/bin/python ingest.py --reset` — ICH 문서 추가 + MIME 버그 수정 후 미실행 상태. ICH 추가 완료 후 실행 (비전 비용 크면 `--no-vision`)
 - **(optional) 임베딩 업그레이드** `text-embedding-3-small` → `text-embedding-3-large` — 한↔영 교차 언어 dense 검색 정렬이 더 좋음. 비용 ~6.5배 + 전체 재색인 필요. 한·영 이중 검색어(7단계)만으로 ICH 검색 품질이 부족할 때 도입 판단. 변경 시 `config.py` `EMBED_MODEL` 수정 후 `--reset` 재색인
+- **검색 재랭킹** — interleave 후에도 general case(예: 25°C/60%RH)가 특수 케이스보다 상위에 못 올라오는 경우 있음. `doc_type`/문서 우선순위 기반 재랭킹 검토
+- **Codex 미조치 항목** — structured output 실패 fallback, 중복키 안정화, 업로드 PDF `doc_type` 태깅 (실제 문제 발생 시 처리)
 - 평가 데이터셋 확장 (후속 질문 시나리오, 이미지 설명 청크 검증 문항, **웹 폴백 시나리오**)
 - README.md 보완 예정 항목: MultiVectorRetriever, HWP 표 추출, 이미지 설명 캐싱, DB 통계 사이드바
 - 프롬프트·검색 파라미터 변경 시 eval_rag.py 로 회귀 테스트
