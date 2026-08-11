@@ -281,6 +281,52 @@ Codex 코드 리뷰(`/codex:review`)가 지적한 기존 코드 버그 3건 수�
 
 ---
 
+## 8단계 — 생성 실패 시 웹 폴백 안전망 (`check` 노드) (2026-08-11)
+
+**목적**: "문서에 없으면 → 웹 검색" 폴백이 실제로는 안 걸리던 사각지대 해결.
+
+**문제 (기존 구조의 약점)**: 웹 폴백 진입 여부를 답변 생성 **전**의 `grade`(관련성 이진 판정)가
+결정한다. 그런데 `grade` 프롬프트가 *"키워드·의미가 조금이라도 연결되면 yes"* 로 느슨해서,
+**실제로는 답이 없는데도** 느슨하게 관련된 청크(예: 카드뮴 질문에 딸려온 CGMP 해설서)만 있으면
+`yes`로 통과 → 바로 `generate` → 문맥에 답이 없어 `"찾을 수 없습니다"` 출력하고 **그대로 종료**.
+웹 검색은 시도조차 안 됨 → 사용자 기대("없으면 웹으로")와 어긋남.
+
+**변경 파일**: `graph.py`
+
+**구현 내용**
+- `graph.py` — `generate` 뒤에 조건부 엣지 `check_answer` 추가:
+  `generate → check ─┬→ END  └→ web_search`(답 없음 & 웹 미시도 시).
+  실제 생성된 답변을 보고 판단하므로 `grade`가 속아도 마지막에 웹으로 폴백됨.
+  - `check_answer`: `WEB_SEARCH_FALLBACK` on + `web_attempted`=False + 답변에 "찾을 수 없" 포함 →
+    `web_search`, 아니면 `END`
+  - **`web_attempted` 상태 플래그 신설** (기존 `web_searched`=웹이 내용을 *찾았는지* 와 구분).
+    `web_search` 노드가 성공·실패·예외 **모든 경로에서 `web_attempted=True` 반환** →
+    `web_search → generate → check` 재진입 시 무한 루프 차단
+  - `web_searched` 주석 명확화(웹이 실제로 내용을 찾았는지 = 웹 출처 표시용)
+
+**검증**
+- 그래프 컴파일 OK, 엣지 배선 확인: `generate → {web_search(조건부), END(조건부)}`, `web_search → generate`
+- `check_answer` 결정적 단위 테스트 5종 전부 통과:
+  답없음+웹미시도→web_search / 답없음+웹시도함→END(루프방지) / 정상답변→END /
+  answer키없음→END / `WEB_SEARCH_FALLBACK=False`→END
+- 실동작 스모크(문서 외 질문 "EU Annex 1 CCS"): route→retrieve→rewrite×2→web_search(성공)→generate→**END**
+  (기존 grade 경로 + 신규 가드 동시 정상, 루프 없음)
+
+**Codex QC** (`/codex:rescue`, 2026-08-11) — 이번 변경(graph.py 미커밋 diff) 검증
+- **판정: 블로킹 이슈 없음.** 무한 루프 없음 확인 —
+  `generate → check_answer → web_search → generate → check_answer → END` 사이클에서
+  `web_search`의 세 return 경로가 모두 `web_attempted=True`를 세팅하므로 두 번째 `check_answer`는
+  답변이 또 실패해도 항상 `END`로 감. `web_attempted` 커버리지(예외/빈결과/성공) 3경로 확인
+- **마이너 지적 (미조치 — 우선순위 낮음)**:
+  1. `_answer_not_found` 의 substring 검사(`"찾을 수 없" in answer`)는 오탐(문구 우연 포함)·
+     미탐(표현 변형·영어 폴백 문구) 가능. `web_attempted` 가드가 루프는 이미 막고 있어 위험 낮음.
+     개선안: SYSTEM_PROMPT 정확 거절 문구(`"제공된 문서에서"` + `"찾을 수 없"`)로 좁히기
+  2. `web_search`의 `ChatOpenAI(...).bind_tools(...)`가 `try` 블록 밖(graph.py:234-236)이라
+     모델 생성 단계 예외 시 핸들러를 못 타 `web_attempted`가 안 세팅됨. **루프가 아니라 그래프가
+     죽는 방향**이라 위험 낮음(이번 변경 아닌 기존 코드). 개선안: `bind_tools`를 `try` 안으로 이동
+
+---
+
 ## 다음 단계 (예정)
 
 - **(optional) 임베딩 업그레이드** `text-embedding-3-small` → `text-embedding-3-large` — 한↔영 교차 언어 dense 검색 정렬이 더 좋음. 비용 ~6.5배 + 전체 재색인 필요. 한·영 이중 검색어(7단계)만으로 ICH 검색 품질이 부족할 때 도입 판단. 변경 시 `config.py` `EMBED_MODEL` 수정 후 `--reset` 재색인

@@ -2,9 +2,11 @@
 
 기존 rag.py 의 검색·답변을 그래프 노드로 재구성:
 
-    START → route ─┬→ retrieve → grade ─┬→ generate → END
-                   │      ↑             ├→ rewrite ─┘(재검색)
-                   │      │             └→ web_search → generate
+    START → route ─┬→ retrieve → grade ─┬→ generate → check ─┬→ END
+                   │      ↑             ├→ rewrite ─┘(재검색) │
+                   │      │             └→ web_search → ──────┤(답 없음 → 웹 폴백)
+                   │      │                    ↑              │
+                   │      └────────────────────┴──────────────┘
                    └→ direct → END
 
 - route:      검색 필요 여부 판단 + 후속 질문을 한국어·영어 검색어로 재작성 (LLM 1회로 동시 처리)
@@ -16,6 +18,9 @@
               텍스트로 받아 기존 generate 문맥에 투입. 답변에 웹 출처임을 명시
 - direct:     인사말 등 문서와 무관한 입력은 검색 없이 바로 응답
 - generate:   기존 출처 인용·환각 방지 프롬프트로 최종 답변
+- check:      generate 가 "문서에 답 없음"을 냈고 아직 웹을 시도하지 않았으면 web_search 로 폴백.
+              grade 가 느슨해 관련 없는 청크를 통과시켜도(관련성 판정 실패) 실제 답변 실패를
+              보고 웹으로 넘어가게 하는 마지막 안전망. web_attempted 플래그로 무한 루프 방지
 
 app.py 는 answer_agentic() 만 호출 — answer_with_history() 와 동일하게
 (답변 텍스트, 근거 문서 리스트)를 돌려받음.
@@ -45,7 +50,8 @@ class GraphState(TypedDict):
     search_query_en: str             # 영어 문서(ICH 등) 검색용 영어 검색 질문
     docs: list[Document]             # 검색된 청크
     rewrite_count: int               # 질문 개선 횟수 (무한 루프 방지)
-    web_searched: bool               # 웹 검색 폴백 사용 여부 — generate 가 웹 출처 표시에 사용
+    web_searched: bool               # 웹 검색이 실제로 내용을 찾았는지 — generate 가 웹 출처 표시에 사용
+    web_attempted: bool              # 웹 검색을 한 번이라도 시도했는지 — check 노드의 재폴백 무한루프 방지
     answer: str                      # 최종 답변
     extra_store: Chroma | None       # 세션 업로드 PDF 벡터스토어
 
@@ -228,20 +234,21 @@ def web_search(state: GraphState) -> dict:
     llm = ChatOpenAI(model=config.CHAT_MODEL, temperature=0, use_responses_api=True).bind_tools(
         [{"type": "web_search"}]
     )
+    # web_attempted=True 는 성공·실패 모든 경로에서 반환 — check 노드가 웹 재시도를 하지 않도록
     try:
         resp = (prompt | llm).invoke({"question": state["search_query"]})
         text, urls = _extract_text_and_urls(resp)
     except Exception:
         # 웹 검색 실패 시 기존 검색 결과 그대로 generate — 종전 동작("찾을 수 없습니다")과 동일
-        return {"web_searched": False}
+        return {"web_searched": False, "web_attempted": True}
 
     if not text.strip() or "검색 결과 없음" in text[:30]:
-        return {"web_searched": False}
+        return {"web_searched": False, "web_attempted": True}
 
     if urls:
         text += "\n\n[참고 URL]\n" + "\n".join(urls)
     doc = Document(page_content=text, metadata={"source": "웹 검색 (내부 문서 아님)"})
-    return {"docs": [doc], "web_searched": True}
+    return {"docs": [doc], "web_searched": True, "web_attempted": True}
 
 
 # ── generate / direct: 최종 답변 ────────────────────────────────────
@@ -266,6 +273,25 @@ def generate(state: GraphState) -> dict:
         "question": state["question"],
     })
     return {"answer": resp.content}
+
+
+# 내부 문서로 답을 못 냈다는 신호 — SYSTEM_PROMPT 규칙1의 거절 문구와 맞춤
+# ("제공된 문서에서 해당 내용을 찾을 수 없습니다")
+def _answer_not_found(answer: str) -> bool:
+    return "찾을 수 없" in answer
+
+
+# ── check: generate 실패 시 웹 폴백 (조건부 엣지) ───────────────────
+#
+# grade 는 답변 생성 '전' 에 관련성을 판정하는데, 프롬프트가 느슨해 관련 없는 청크를
+# yes 로 통과시키면 웹 폴백이 걸리지 않고 "찾을 수 없습니다"로 끝나 버린다.
+# 이 노드는 실제 생성된 답변을 보고, 못 찾았고 아직 웹을 안 썼으면 web_search 로 넘긴다.
+def check_answer(state: GraphState) -> Literal["web_search", "__end__"]:
+    if (config.WEB_SEARCH_FALLBACK
+            and not state.get("web_attempted")
+            and _answer_not_found(state.get("answer", ""))):
+        return "web_search"
+    return END
 
 
 def generate_direct(state: GraphState) -> dict:
@@ -304,7 +330,10 @@ def _get_graph():
     )
     workflow.add_edge("rewrite", "retrieve")
     workflow.add_edge("web_search", "generate")
-    workflow.add_edge("generate", END)
+    workflow.add_conditional_edges(
+        "generate", check_answer,
+        {"web_search": "web_search", END: END},
+    )
     workflow.add_edge("direct", END)
     return workflow.compile()
 
@@ -329,6 +358,7 @@ def answer_agentic(
         "docs": [],
         "rewrite_count": 0,
         "web_searched": False,
+        "web_attempted": False,
         "answer": "",
         "extra_store": extra_store,
     })
